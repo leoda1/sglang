@@ -120,6 +120,7 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self.metrics_enabled = False
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
@@ -267,6 +268,9 @@ class MooncakeTransferEngine:
     def get_session_id(self):
         return self.session_id
 
+    def get_metrics_snapshot(self):
+        return self.engine.get_metrics_snapshot() if self.metrics_enabled else None
+
     def send_probe(self, peer_session_id: str) -> int:
         return self.engine.send_probe(peer_session_id)
 
@@ -344,6 +348,13 @@ def maybe_init_shared_mooncake_transfer_engine(
                 server_args.disaggregation_ib_device or server_args.mooncake_ib_device
             ),
         )
+
+        if server_args.enable_metrics and hasattr(
+            _mooncake_transfer_engine.engine, "get_metrics_snapshot"
+        ):
+            _mooncake_transfer_engine.metrics_enabled = (
+                _mooncake_transfer_engine.engine.enable_metrics()
+            )
 
         if server_args.elastic_ep_backend == "mooncake":
             try:
