@@ -196,6 +196,77 @@ class SchedulerMetricsCollector:
         from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
+        self._transfer_engine_previous = {}
+        engine_labels = [key for key in labels if key != "priority"] + ["backend"]
+        counter_fields = (
+            "completed_batches",
+            "failed_batches",
+            "timed_out_batches",
+            "completed_bytes",
+            "duration_seconds",
+            "route_bridge_bytes",
+            "route_direct_bytes",
+            "skip_not_write",
+            "skip_not_cuda",
+            "skip_no_target",
+            "skip_no_device",
+            "skip_same_rail",
+            "skip_no_relay",
+            "relay_ready_bytes",
+            "relay_submitted_bytes",
+            "relay_completed_bytes",
+            "relay_limit_blocked",
+        )
+        self.transfer_engine_counters = {
+            name: Counter(
+                f"sglang:transfer_engine_{name}_total",
+                f"Transfer engine cumulative {name}.",
+                engine_labels,
+            )
+            for name in counter_fields
+        }
+        self.transfer_engine_registered_bytes = Gauge(
+            "sglang:transfer_engine_registered_bytes",
+            "Registered memory bytes (may include engine-owned allocations).",
+            [*engine_labels, "location"],
+            multiprocess_mode="mostrecent",
+        )
+        self.transfer_engine_allocated_bytes = Gauge(
+            "sglang:transfer_engine_allocated_bytes",
+            "Memory reserved by the transfer engine, including cached allocations.",
+            [*engine_labels, "location"],
+            multiprocess_mode="mostrecent",
+        )
+        self.transfer_engine_gauges = {
+            name: Gauge(
+                f"sglang:transfer_engine_{name}",
+                f"Transfer engine {name}.",
+                [*engine_labels, "gpu"],
+                multiprocess_mode="mostrecent",
+            )
+            for name in (
+                "relay_inflight_bytes",
+                "relay_inflight",
+                "relay_limit",
+                "relay_high_watermark",
+            )
+        }
+        self.transfer_engine_lane_slots = Gauge(
+            "sglang:transfer_engine_lane_slots",
+            "Relay lane slot counts by state.",
+            [*engine_labels, "gpu", "lane", "state"],
+            multiprocess_mode="mostrecent",
+        )
+        self.transfer_engine_nics = {
+            name: Gauge(
+                f"sglang:transfer_engine_nic_{name}",
+                f"NIC {name}.",
+                [*engine_labels, "nic"],
+                multiprocess_mode="mostrecent",
+            )
+            for name in ("inflight_bytes", "bandwidth_bytes_per_second")
+        }
+        self._transfer_engine_locations = set()
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
@@ -1200,6 +1271,55 @@ class SchedulerMetricsCollector:
         )
 
         self.last_log_time = time.perf_counter()
+        self._log_transfer_engine_metrics()
+
+    def _log_transfer_engine_metrics(self) -> None:
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            get_mooncake_transfer_engine,
+        )
+
+        engine = get_mooncake_transfer_engine()
+        if engine is None:
+            return
+        snapshot = engine.get_metrics_snapshot()
+        if not snapshot:
+            return
+        labels = {key: value for key, value in self.labels.items() if key != "priority"}
+        labels["backend"] = snapshot["backend"]
+        bridge = snapshot.get("bridge", {})
+        counters = {**snapshot, **bridge.get("counters", {})}
+        for name, counter in self.transfer_engine_counters.items():
+            if name not in counters:
+                continue
+            value = counters[name]
+            previous = self._transfer_engine_previous.get(name, 0)
+            counter.labels(**labels).inc(
+                value - previous if value >= previous else value
+            )
+            self._transfer_engine_previous[name] = value
+        registered = snapshot["registered_bytes"]
+        allocated = snapshot.get("allocated_bytes", {})
+        self._transfer_engine_locations.update(registered)
+        self._transfer_engine_locations.update(allocated)
+        for location in self._transfer_engine_locations:
+            self.transfer_engine_registered_bytes.labels(
+                **labels, location=location
+            ).set(registered.get(location, 0))
+            self.transfer_engine_allocated_bytes.labels(
+                **labels, location=location
+            ).set(allocated.get(location, 0))
+        if bridge:
+            gpu_labels = {**labels, "gpu": str(bridge["gpu"])}
+            for name, gauge in self.transfer_engine_gauges.items():
+                gauge.labels(**gpu_labels).set(bridge["gauges"].get(name, 0))
+            for lane, slots in enumerate(bridge["lanes"]):
+                for state in ("empty", "cuda_pending", "rdma_pending"):
+                    self.transfer_engine_lane_slots.labels(
+                        **gpu_labels, lane=str(lane), state=state
+                    ).set(slots[state])
+        for nic, values in snapshot.get("nics", {}).items():
+            for name, gauge in self.transfer_engine_nics.items():
+                gauge.labels(**labels, nic=nic).set(values[name])
 
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:

@@ -109,6 +109,7 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self.metrics_enabled = False
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
@@ -254,6 +255,9 @@ class MooncakeTransferEngine:
     def get_session_id(self):
         return self.session_id
 
+    def get_metrics_snapshot(self):
+        return self.engine.get_metrics_snapshot() if self.metrics_enabled else None
+
     def get_engine(self):
         return self.engine.get_engine()
 
@@ -265,6 +269,7 @@ def init_mooncake_transfer_engine(
     hostname: str,
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
+    enable_metrics: bool = False,
 ) -> MooncakeTransferEngine:
     """
     Initialize the shared MooncakeTransferEngine. Note: if already
@@ -278,6 +283,12 @@ def init_mooncake_transfer_engine(
     _mooncake_transfer_engine = MooncakeTransferEngine(
         hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
     )
+    if enable_metrics and hasattr(
+        _mooncake_transfer_engine.engine, "get_metrics_snapshot"
+    ):
+        _mooncake_transfer_engine.metrics_enabled = (
+            _mooncake_transfer_engine.engine.enable_metrics()
+        )
     return _mooncake_transfer_engine
 
 
