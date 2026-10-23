@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -194,6 +195,27 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        self._transfer_sockets = threading.local()
+        self._transfer_data_logged = False
+        self._tp_slice_logged = False
+        self._batch_metrics = None
+        if (
+            server_args.enable_metrics
+            and disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            from sglang.srt.disaggregation.mooncake.metrics import BatchTransferMetrics
+
+            self._batch_metrics = BatchTransferMetrics(
+                {
+                    **(server_args.extra_metric_labels or {}),
+                    "model_name": server_args.served_model_name,
+                    "engine_type": "prefill",
+                    "tp_rank": args.engine_rank,
+                    "pp_rank": self.pp_rank,
+                    "cp_rank": self.attn_cp_rank,
+                    "dp_rank": self.system_dp_rank,
+                }
+            )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
@@ -253,6 +275,20 @@ class MooncakeKVManager(CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _connect(self, endpoint: str, is_ipv6: bool = False):
+        # Different transfer queues must not share a ZMQ socket.
+        if not hasattr(self._transfer_sockets, "sockets"):
+            self._transfer_sockets.sockets = {}
+        sockets = self._transfer_sockets.sockets
+        key = (endpoint, is_ipv6)
+        if key not in sockets:
+            socket = zmq.Context.instance().socket(zmq.PUSH)
+            if is_ipv6:
+                socket.setsockopt(zmq.IPV6, 1)
+            socket.connect(endpoint)
+            sockets[key] = socket
+        return sockets[key]
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
@@ -559,6 +595,7 @@ class MooncakeKVManager(CommonKVManager):
         ret = self._transfer_data(
             mooncake_session_id,
             [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
+            kind="staging",
         )
         if ret != 0:
             raise RuntimeError(
@@ -569,13 +606,40 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _timed_batch_transfer(
+        self, path, mooncake_session_id, src_addrs, dst_addrs, lengths
+    ):
+        if self._batch_metrics is None:
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+        byte_count = sum(lengths)
+        result = None
+        start_ns = time.perf_counter_ns()
+        try:
+            result = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+            return result
+        finally:
+            elapsed_ns = time.perf_counter_ns() - start_ns
+            self._batch_metrics.observe(
+                path, len(lengths), byte_count, elapsed_ns, result == 0
+            )
+
+    def _transfer_data(
+        self, mooncake_session_id, transfer_blocks, *, kind="aux_or_state"
+    ):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        return self._timed_batch_transfer(
+            f"_transfer_data/{kind}",
+            mooncake_session_id,
+            list(src_addrs),
+            list(dst_addrs),
+            list(lengths),
         )
 
     def _send_kvcache_generic(
@@ -587,6 +651,8 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        *,
+        kind: str = "kv",
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -655,15 +721,31 @@ class MooncakeKVManager(CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id, transfer_blocks, kind=f"{kind}_per_layer"
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id, transfer_blocks, kind=f"{kind}_all_layers"
+            )
 
+        if kind == "kv" and not self._transfer_data_logged:
+            with self.session_lock:
+                if not self._transfer_data_logged:
+                    self._transfer_data_logged = True
+                    logger.info(
+                        "Mooncake KV path=_transfer_data rank=%s session=%s "
+                        "mode=%s layers=%s",
+                        self.kv_args.engine_rank,
+                        mooncake_session_id,
+                        "per_layer" if self.enable_custom_mem_pool else "all_layers",
+                        len(layers_params),
+                    )
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
@@ -847,11 +929,28 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            if not self._tp_slice_logged:
+                with self.session_lock:
+                    if not self._tp_slice_logged:
+                        self._tp_slice_logged = True
+                        logger.info(
+                            "Mooncake transfer path=process_layer_tp_aware "
+                            "rank=%s session=%s slices=%s bytes=%s",
+                            self.kv_args.engine_rank,
+                            mooncake_session_id,
+                            total_slices,
+                            total_slices * heads_bytes_per_token_to_send,
+                        )
+            return self._timed_batch_transfer(
+                "process_layer_tp_aware",
+                mooncake_session_id,
+                src_addr_list,
+                dst_addr_list,
+                length_list,
             )
 
         futures = []
+        # if model has 64 layers, 1 chunk equal to 128 batch_transfer_sync calls
         for i in range(layers_current_pp_stage):
             futures.append(
                 executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
@@ -1072,6 +1171,7 @@ class MooncakeKVManager(CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        kind="state",
                     )
                     or rc
                 )
